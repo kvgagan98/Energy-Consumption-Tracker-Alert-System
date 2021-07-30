@@ -7,6 +7,11 @@
 #define BAUDRATE 115200L
 #define SARCLK 18000000L
 
+//For the Flash Memory
+#define TIMER_2_FREQ 22050L  // Must match the frequency of the wav file store in external SPI flash
+#define F_SCK_MAX 20000000L  // Max SPI SCK freq (Hz) 
+#define CS P0_3
+
 #define LCD_RS P2_0
 #define LCD_RW P1_7
 #define LCD_E  P1_6
@@ -17,8 +22,37 @@
 #define CHARS_PER_LINE 16
 
 #define HOUR_SELECT P3_2
-#define MINUTE_SELECT P3_0
+#define MINUTE_SELECT P2_6
 #define START_SELECT P2_5
+
+// Flash memory commands
+#define WRITE_ENABLE     0x06  // Address:0 Dummy:0 Num:0 fMax: 25MHz
+#define WRITE_DISABLE    0x04  // Address:0 Dummy:0 Num:0 fMax: 25MHz
+#define READ_STATUS      0x05  // Address:0 Dummy:0 Num:1 to infinite fMax: 32MHz
+#define READ_BYTES       0x03  // Address:3 Dummy:0 Num:1 to infinite fMax: 20MHz
+#define READ_SILICON_ID  0xab  // Address:0 Dummy:3 Num:1 to infinite fMax: 32MHz
+#define FAST_READ        0x0b  // Address:3 Dummy:1 Num:1 to infinite fMax: 40MHz
+#define WRITE_STATUS     0x01  // Address:0 Dummy:0 Num:1 fMax: 25MHz
+#define WRITE_BYTES      0x02  // Address:3 Dummy:0 Num:1 to 256 fMax: 25MHz
+#define ERASE_ALL        0xc7  // Address:0 Dummy:0 Num:0 fMax: 25MHz
+#define ERASE_BLOCK      0xd8  // Address:3 Dummy:0 Num:0 fMax: 25MHz
+#define READ_DEVICE_ID   0x9f  // Address:0 Dummy:2 Num:1 to infinite fMax: 25MHz
+
+// SPI Flash Memory connections:
+// 	P0.0: SCK  connected to pin 6
+// 	P0.1: MISO connected to pin 2
+// 	P0.2: MOSI connected to pin 5
+//  P0.3: CS*  connected to pin 1
+//  3.3V: connected to pins 3, 7, and 8
+//  GND:  connected to pin 4
+
+volatile unsigned long int playcnt=0;
+
+union long_bytes
+{
+    long l;
+    unsigned char b[4];
+};
 
 char _c51_external_startup (void)
 {
@@ -68,8 +102,16 @@ char _c51_external_startup (void)
 		#error SYSCLK must be either 12250000L, 24500000L, 48000000L, or 72000000L
 	#endif
 	
-	P0MDOUT |= 0x10; // Enable UART0 TX as push-pull output
-	XBR0     = 0x01; // Enable UART0 on P0.4(TX) and P0.5(RX)                     
+	// Initialize the pin used by DAC0 (P3.0 in the LQFP32 package)
+	// 1. Clear the bit associated with the pin in the PnMDIN register to 0. This selects analog mode for the pin.
+    // 2. Set the bit associated with the pin in the Pn register to 1.
+    // 3. Skip the bit associated with the pin in the PnSKIP register to ensure the crossbar does not attempt to assign a function to the pin.
+	P3MDIN&=0b_1111_1110;
+	P3|=0b_0000_0001;
+	//P3SKIP|=0b_0000_0001; // P3 Pins Not Available on Crossbar
+
+	P0MDOUT |= 0b_0001_1101; // Enable UART0 TX as push-pull output
+	XBR0     = 0x03; // Enable UART0 on P0.4(TX) and P0.5(RX)                     
 	XBR1     = 0X00;
 	XBR2     = 0x40; // Enable crossbar and weak pull-ups
 
@@ -85,7 +127,112 @@ char _c51_external_startup (void)
 	TR1 = 1; // START Timer1
 	TI = 1;  // Indicate TX0 ready
   	
+	// Initialize DAC
+	SFRPAGE = 0x30; 
+  	DACGCF0=0b_1000_1000; // 1:D23REFSL(VCC) 1:D3AMEN(NORMAL) 2:D3SRC(DAC3H:DAC3L) 1:D01REFSL(VCC) 1:D1AMEN(NORMAL) 1:D1SRC(DAC1H:DAC1L)
+  	DACGCF1=0b_0000_0000;
+  	DACGCF2=0b_0010_0010; // Reference buffer gain 1/3 for all channels
+  	DAC0CF0=0b_1000_0000; // Enable DAC 0
+  	DAC0CF1=0b_0000_0010; // DAC gain is 3.  Therefore the overall gain is 1.
+  	DAC0=0x80<<4;
+
+	SFRPAGE = 0x00; 
+
+	// SPI inititialization
+	SPI0CKR = (SYSCLK/(2*F_SCK_MAX))-1;
+	SPI0CFG = 0b_0100_0000; //SPI in master mode
+	SPI0CN0 = 0b_0000_0001; //SPI enabled and in three wire mode
+	CS=1;
+
+	// Initialize timer 2 for periodic interrupts
+	TMR2CN0=0x00;   // Stop Timer2; Clear TF2;
+	CKCON0|=0b_0001_0000; // Timer 2 uses the system clock
+	TMR2RL=(0x10000L-(SYSCLK/TIMER_2_FREQ)); // Initialize reload value
+	TMR2=0xffff;   // Set to reload immediately
+	ET2=1;         // Enable Timer2 interrupts
+	TR2=1;         // Start Timer2 (TMR2CN is bit addressable)
+
+	EA=1; // Enable interrupts
+  		
 	return 0;
+}
+
+unsigned char getbyte (void)
+{
+	char c;
+	while (!RI);
+	RI=0;
+	c=SBUF;
+	return c;
+}
+
+void putbyte (char c)
+{
+	while (!TI);
+	TI=0;
+	SBUF=c;
+}
+
+unsigned char SPIWrite (unsigned char x)
+{
+   SPI0DAT=x;
+   while(!SPIF);
+   SPIF=0;
+   return SPI0DAT;
+}
+
+void Timer2_ISR (void) interrupt INTERRUPT_TIMER2
+{
+	unsigned char x;
+	
+	SFRPAGE=0x0;
+	TF2H = 0; // Clear Timer2 interrupt flag
+
+	if(playcnt==0)
+	{
+		CS=1; // Done playing
+		TR2=0;
+	}
+	else
+	{
+		x=SPIWrite(0x55);
+		SFRPAGE = 0x30;
+		DAC0=x<<4;
+		playcnt--;
+	}
+}
+
+void Start_Playback (unsigned long int address, unsigned long int numb)
+{
+	CS=1;
+	TR2=0;
+	TMR2=0xffff; // Set to reload immediately
+    CS=0;
+    SPIWrite(READ_BYTES);
+    SPIWrite((unsigned char)((address>>16)&0xff));
+    SPIWrite((unsigned char)((address>>8)&0xff));
+    SPIWrite((unsigned char)(address&0xff));
+    playcnt=numb;
+    TR2=1;
+}
+
+void Enable_Write (void)
+{
+    CS=0;
+    SPIWrite(WRITE_ENABLE);
+    CS=1;
+}
+
+void Check_WIP (void)
+{
+	unsigned char c;
+	do
+	{
+	    CS=0;
+	    SPIWrite(READ_STATUS);
+	    c=SPIWrite(0x55);
+	    CS=1;
+	} while (c&0x01);
 }
 
 void InitADC (void)
@@ -147,24 +294,6 @@ void Timer3us(unsigned char us)
 	TMR3CN0 = 0 ;                   // Stop Timer3 and clear overflow flag
 }
 
-
-void Timer2us(unsigned char us){
-	unsigned char i;
-
-	CKCON0|=0b_0001_0000; //Input for Timer 2 selected as SYSCLK by selecting 
-	TMR2RL = (-(SYSCLK)/1000000L);
-	TMR2 = TMR2RL;
-
-
-	TMR2CN0 = 0x04; //Start Timer 2
-	for (i = 0; i < us; i++){
-		while (!(TMR2CN0 & 0x80));
-		TMR2CN0 &= ~(0x80);
-	}
-
-	TMR2CN0 = 0;
-}
-
 void LCD_pulse (void)
 {
 	LCD_E=1;
@@ -196,13 +325,6 @@ void waitms (unsigned int ms)
 	unsigned char k;
 	for(j=0; j<ms; j++)
 		for (k=0; k<4; k++) Timer3us(250);
-}
-
-void waitms_timer2 (unsigned int ms){
-	unsigned int j;
-	unsigned char k;
-	for(j=0; j<ms; j++)
-		for (k=0; k<4; k++) Timer2us(250);
 }
 
 void WriteData (unsigned char x)
@@ -335,6 +457,9 @@ void main (void)
 	InitPinADC(2, 4); // Configure P2.4 as analog input
     InitADC();
 
+	CS=1;
+	TR2=0;
+	Start_Playback(0x100L, 0x3F0F0L);
 	//while pushbutton is not pressed display which one user wants to select
 	while (START_SELECT == 1){
 		LCDprint("REMIND ME AFTER",1,1);
@@ -358,6 +483,7 @@ void main (void)
 	LCDprint("WILL ALERT U IN",1,1);
 	sprintf(buff,"  %i hrs %i mins",hours_select,minutes_select);
 	LCDprint(buff,2,1);
+	Start_Playback(0x3F1F0L,0xF000L);
 	waitms(6000);
 
 	while(1)
@@ -402,6 +528,10 @@ void main (void)
 
 		kwh = power/1000.0*(1/3600.0)*(seconds);
 		est_cost = kwh*cost_per_kwh*100;
+
+		if (hours_select == timer_hours_counter && minutes_select == timer_minutes_counter && vpeak > 0.007) {
+			Start_Playback(0x4E1F0L, 0xF0000L);
+		}
 
         if (timer_flag == 4){
             LCDprint("DEVICE ON SINCE", 1,1);
